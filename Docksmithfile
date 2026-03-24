@@ -2,5 +2,5 @@ FROM alpine:3.18
 WORKDIR /app
 ENV NAME=Docksmith
 COPY . /app
-RUN echo hello
+RUN echo "hello world" > test.txt
 CMD ["python","main.py"]
