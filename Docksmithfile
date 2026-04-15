@@ -1,6 +1,4 @@
 FROM alpine:3.18
 WORKDIR /app
-ENV NAME=Docksmith
-COPY . /app
-RUN echo "hello world" > test.txt
-CMD ["python","main.py"]
+ENV MESSAGE=Hello
+CMD ["/bin/sh","-c","echo $MESSAGE && echo build complete"]

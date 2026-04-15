@@ -1,76 +1,74 @@
 package parser
 
 import (
-	"bufio"
-	"fmt"
-	"os"
-	"strings"
+    "bufio"
+    "encoding/json"
+    "fmt"
+    "os"
+    "strings"
 )
 
 func ParseDocksmithfile(path string) ([]Instruction, *BuildState, error) {
+    file, err := os.Open(path)
+    if err != nil {
+        return nil, nil, err
+    }
+    defer file.Close()
 
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer file.Close()
+    scanner := bufio.NewScanner(file)
+    state := NewBuildState()
+    var instructions []Instruction
+    lineNo := 0
 
-	scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        lineNo++
+        line := strings.TrimSpace(scanner.Text())
 
-	var instructions []Instruction
-	state := NewBuildState()
+        if line == "" || strings.HasPrefix(line, "#") {
+            continue
+        }
 
-	lineNumber := 0
+        parts := strings.SplitN(line, " ", 2)
+        if len(parts) < 2 {
+            return nil, nil, fmt.Errorf("invalid instruction at line %d", lineNo)
+        }
 
-	for scanner.Scan() {
+        cmd, args := parts[0], strings.TrimSpace(parts[1])
 
-		lineNumber++
-		line := strings.TrimSpace(scanner.Text())
+        switch cmd {
+        case "FROM":
+            instructions = append(instructions, Instruction{FROM, args, lineNo})
 
-		if line == "" {
-			continue
-		}
+        case "COPY":
+            instructions = append(instructions, Instruction{COPY, args, lineNo})
 
-		parts := strings.SplitN(line, " ", 2)
+        case "RUN":
+            instructions = append(instructions, Instruction{RUN, args, lineNo})
 
-		if len(parts) < 2 {
-			return nil, nil, fmt.Errorf("invalid instruction at line %d", lineNumber)
-		}
+        case "WORKDIR":
+            state.WorkDir = args
+            instructions = append(instructions, Instruction{WORKDIR, args, lineNo})
 
-		cmd := parts[0]
-		args := parts[1]
+        case "ENV":
+            kv := strings.SplitN(args, "=", 2)
+            if len(kv) != 2 {
+                return nil, nil, fmt.Errorf("invalid ENV at line %d", lineNo)
+            }
+            state.Env[kv[0]] = kv[1]
+            instructions = append(instructions, Instruction{ENV, args, lineNo})
 
-		switch cmd {
+        case "CMD":
+            var cmdArr []string
+            if err := json.Unmarshal([]byte(args), &cmdArr); err != nil {
+                return nil, nil, fmt.Errorf("CMD must be JSON array at line %d", lineNo)
+            }
+            state.Cmd = args
+            instructions = append(instructions, Instruction{CMD, args, lineNo})
 
-		case "FROM":
-			instructions = append(instructions, Instruction{FROM, args, lineNumber})
+        default:
+            return nil, nil, fmt.Errorf("unknown instruction '%s' at line %d", cmd, lineNo)
+        }
+    }
 
-		case "COPY":
-			instructions = append(instructions, Instruction{COPY, args, lineNumber})
-
-		case "RUN":
-			instructions = append(instructions, Instruction{RUN, args, lineNumber})
-
-		case "WORKDIR":
-			state.WorkDir = args
-			instructions = append(instructions, Instruction{WORKDIR, args, lineNumber})
-
-		case "ENV":
-			envParts := strings.SplitN(args, "=", 2)
-			if len(envParts) != 2 {
-				return nil, nil, fmt.Errorf("invalid ENV at line %d", lineNumber)
-			}
-			state.Env[envParts[0]] = envParts[1]
-			instructions = append(instructions, Instruction{ENV, args, lineNumber})
-
-		case "CMD":
-			state.Cmd = args
-			instructions = append(instructions, Instruction{CMD, args, lineNumber})
-
-		default:
-			return nil, nil, fmt.Errorf("unknown instruction '%s' at line %d", cmd, lineNumber)
-		}
-	}
-
-	return instructions, state, nil
+    return instructions, state, nil
 }

@@ -93,10 +93,10 @@ func SaveCache(key string, layerDigest string) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-func PrintHit(instruction string) {
-	fmt.Printf(" ---> [CACHE HIT] %s\n", instruction)
+func PrintHit() {
+    fmt.Print(" [CACHE HIT]")
 }
 
-func PrintMiss(instruction string) {
-	fmt.Printf(" ---> [CACHE MISS] %s\n", instruction)
+func PrintMiss() {
+    fmt.Print(" [CACHE MISS]")
 }

@@ -1,76 +1,113 @@
 package builder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
+
 	"docksmith/cache"
 	"docksmith/layer"
 	"docksmith/parser"
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
+	"docksmith/runtime"
 )
 
-func Build(contextPath string, imageName string, noCache bool) error {
+type BuildResult struct {
+	ImageDigest  string
+	LayerDigests []string
+	Env          map[string]string
+	Cmd          []string
+	WorkDir      string
+	CreatedBy    []string
+	Created      string
+}
 
+func Build(contextPath string, imageName string, tag string, noCache bool) (*BuildResult, error) {
 	docksmithfilePath := filepath.Join(contextPath, "Docksmithfile")
 
+	//
+	// ✅ parser
+	//
 	instructions, state, err := parser.ParseDocksmithfile(docksmithfilePath)
 	if err != nil {
-		return fmt.Errorf("parse error: %w", err)
+		return nil, fmt.Errorf("parse error: %w", err)
 	}
 
 	var prevDigest string
-	var layers []string
+	var layerDigests []string
+	var createdBy []string
+	var baseCreated string
+
 	cascadeMiss := false
 	prevFileState := make(map[string]string)
 
 	total := len(instructions)
 
 	for i, inst := range instructions {
-
 		stepNum := i + 1
 
 		switch inst.Type {
 
+		//
+		// ✅ FROM loads base manifest
+		//
 		case parser.FROM:
 			fmt.Printf("Step %d/%d : FROM %s\n", stepNum, total, inst.Args)
+
 			prevDigest = inst.Args
 
-		case parser.COPY:
+			// preserve created timestamp on warm rebuild
+			baseManifest, err := runtime.LoadManifest(inst.Args)
+			if err == nil {
+				baseCreated = baseManifest.Created
+			}
 
+		//
+		// ✅ COPY → cache → layer
+		//
+		case parser.COPY:
 			fmt.Printf("Step %d/%d : COPY %s\n", stepNum, total, inst.Args)
 
 			allFiles, err := layer.GetAllFiles(contextPath)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			fileHashes := make(map[string]string)
 			for _, f := range allFiles {
 				h, err := layer.HashFile(filepath.Join(contextPath, f))
 				if err != nil {
-					return err
+					return nil, err
 				}
 				fileHashes[f] = h
 			}
 
-			key := cache.GenerateCacheKey(prevDigest, string(inst.Type)+" "+inst.Args, state.WorkDir, state.Env, fileHashes)
+			key := cache.GenerateCacheKey(
+				prevDigest,
+				"COPY "+inst.Args,
+				state.WorkDir,
+				state.Env,
+				fileHashes,
+			)
 
 			if !noCache && !cascadeMiss {
 				if digest, hit := cache.CheckCache(key); hit {
-					cache.PrintHit(inst.Args)
+					cache.PrintHit()
 					prevDigest = digest
-					layers = append(layers, digest)
+					layerDigests = append(layerDigests, digest)
+					createdBy = append(createdBy, "COPY "+inst.Args)
 					continue
 				}
 			}
 
+			cache.PrintMiss()
 			cascadeMiss = true
-			cache.PrintMiss(inst.Args)
 
 			changedFiles, newState, err := layer.GetChangedFiles(contextPath, allFiles, prevFileState)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			prevFileState = newState
 
@@ -80,7 +117,7 @@ func Build(contextPath string, imageName string, noCache bool) error {
 
 			layerObj, err := layer.CreateLayer(contextPath, changedFiles)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			if !noCache {
@@ -88,32 +125,50 @@ func Build(contextPath string, imageName string, noCache bool) error {
 			}
 
 			prevDigest = layerObj.Digest
-			layers = append(layers, layerObj.Digest)
+			layerDigests = append(layerDigests, layerObj.Digest)
+			createdBy = append(createdBy, "COPY "+inst.Args)
 
+		//
+		// ✅ RUN → cache → isolated runtime → layer
+		//
 		case parser.RUN:
-
 			fmt.Printf("Step %d/%d : RUN %s\n", stepNum, total, inst.Args)
 
-			key := cache.GenerateCacheKey(prevDigest, string(inst.Type)+" "+inst.Args, state.WorkDir, state.Env, nil)
+			key := cache.GenerateCacheKey(
+				prevDigest,
+				"RUN "+inst.Args,
+				state.WorkDir,
+				state.Env,
+				nil,
+			)
 
 			if !noCache && !cascadeMiss {
 				if digest, hit := cache.CheckCache(key); hit {
-					cache.PrintHit(inst.Args)
+					cache.PrintHit()
 					prevDigest = digest
-					layers = append(layers, digest)
+					layerDigests = append(layerDigests, digest)
+					createdBy = append(createdBy, "RUN "+inst.Args)
 					continue
 				}
 			}
 
+			cache.PrintMiss()
 			cascadeMiss = true
-			cache.PrintMiss(inst.Args)
 
 			beforeFiles, _ := layer.GetAllFiles(contextPath)
 			_, beforeState, _ := layer.GetChangedFiles(contextPath, beforeFiles, prevFileState)
 
-			err := layer.ExecuteRunCommand(inst.Args, contextPath, state.Env)
+			//
+			// ✅ REQUIRED isolated execution
+			//
+			err := runtime.RunHostCommand(
+				inst.Args,
+				contextPath,
+				envMapToSlice(state.Env),
+				state.WorkDir,
+			)
 			if err != nil {
-				return fmt.Errorf("RUN failed: %w", err)
+				return nil, fmt.Errorf("RUN failed: %w", err)
 			}
 
 			afterFiles, _ := layer.GetAllFiles(contextPath)
@@ -121,13 +176,12 @@ func Build(contextPath string, imageName string, noCache bool) error {
 			prevFileState = afterState
 
 			if len(changedFiles) == 0 {
-				fmt.Println("    (no file changes from RUN)")
 				continue
 			}
 
 			layerObj, err := layer.CreateLayer(contextPath, changedFiles)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			if !noCache {
@@ -135,7 +189,8 @@ func Build(contextPath string, imageName string, noCache bool) error {
 			}
 
 			prevDigest = layerObj.Digest
-			layers = append(layers, layerObj.Digest)
+			layerDigests = append(layerDigests, layerObj.Digest)
+			createdBy = append(createdBy, "RUN "+inst.Args)
 
 		case parser.WORKDIR:
 			fmt.Printf("Step %d/%d : WORKDIR %s\n", stepNum, total, inst.Args)
@@ -148,18 +203,30 @@ func Build(contextPath string, imageName string, noCache bool) error {
 		}
 	}
 
-	fmt.Println("\n Build complete")
-	fmt.Println("Layers:")
-	for _, l := range layers {
-		fmt.Println("  sha256:" + l[:12] + "...")
+	//
+	// ✅ deterministic image digest from layer chain
+	//
+	h := sha256.New()
+	sorted := append([]string{}, layerDigests...)
+	sort.Strings(sorted)
+
+	for _, l := range sorted {
+		h.Write([]byte(l))
 	}
-	fmt.Println("WORKDIR:", state.WorkDir)
-	fmt.Println("ENV:", strings.Join(envMapToSlice(state.Env), ", "))
-	fmt.Println("CMD:", state.Cmd)
 
-	_ = os.Getenv("HOME")
+	imageDigest := "sha256:" + hex.EncodeToString(h.Sum(nil))
 
-	return nil
+	result := &BuildResult{
+		ImageDigest:  imageDigest,
+		LayerDigests: layerDigests,
+		Env:          state.Env,
+		Cmd:          parseCmd(state.Cmd),
+		WorkDir:      state.WorkDir,
+		CreatedBy:    createdBy,
+		Created:      baseCreated,
+	}
+
+	return result, nil
 }
 
 func envMapToSlice(env map[string]string) []string {
@@ -167,146 +234,31 @@ func envMapToSlice(env map[string]string) []string {
 	for k, v := range env {
 		result = append(result, k+"="+v)
 	}
+	sort.Strings(result)
 	return result
 }
 
-// BuildAndReturn runs the build and returns layers + state for CLI to save manifest
-func BuildAndReturn(contextPath string, imageName string, noCache bool) ([]string, *parser.BuildState, error) {
+func parseCmd(cmd string) []string {
+	cmd = strings.TrimSpace(cmd)
 
-	docksmithfilePath := filepath.Join(contextPath, "Docksmithfile")
+	// JSON array style CMD
+	if strings.HasPrefix(cmd, "[") && strings.HasSuffix(cmd, "]") {
+		cmd = strings.TrimPrefix(cmd, "[")
+		cmd = strings.TrimSuffix(cmd, "]")
 
-	instructions, state, err := parser.ParseDocksmithfile(docksmithfilePath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse error: %w", err)
-	}
+		parts := strings.Split(cmd, ",")
 
-	var prevDigest string
-	var layers []string
-	cascadeMiss := false
-	prevFileState := make(map[string]string)
-
-	total := len(instructions)
-
-	for i, inst := range instructions {
-
-		stepNum := i + 1
-
-		switch inst.Type {
-
-		case parser.FROM:
-			fmt.Printf("Step %d/%d : FROM %s\n", stepNum, total, inst.Args)
-			prevDigest = inst.Args
-
-		case parser.COPY:
-
-			fmt.Printf("Step %d/%d : COPY %s\n", stepNum, total, inst.Args)
-
-			allFiles, err := layer.GetAllFiles(contextPath)
-			if err != nil {
-				return nil, nil, err
+		var result []string
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			p = strings.Trim(p, `"`)
+			if p != "" {
+				result = append(result, p)
 			}
-
-			fileHashes := make(map[string]string)
-			for _, f := range allFiles {
-				h, err := layer.HashFile(filepath.Join(contextPath, f))
-				if err != nil {
-					return nil, nil, err
-				}
-				fileHashes[f] = h
-			}
-
-			key := cache.GenerateCacheKey(prevDigest, string(inst.Type)+" "+inst.Args, state.WorkDir, state.Env, fileHashes)
-
-			if !noCache && !cascadeMiss {
-				if digest, hit := cache.CheckCache(key); hit {
-					cache.PrintHit(inst.Args)
-					prevDigest = digest
-					layers = append(layers, digest)
-					continue
-				}
-			}
-
-			cascadeMiss = true
-			cache.PrintMiss(inst.Args)
-
-			changedFiles, newState, err := layer.GetChangedFiles(contextPath, allFiles, prevFileState)
-			if err != nil {
-				return nil, nil, err
-			}
-			prevFileState = newState
-
-			if len(changedFiles) == 0 {
-				changedFiles = allFiles
-			}
-
-			layerObj, err := layer.CreateLayer(contextPath, changedFiles)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			if !noCache {
-				cache.SaveCache(key, layerObj.Digest)
-			}
-
-			prevDigest = layerObj.Digest
-			layers = append(layers, layerObj.Digest)
-
-		case parser.RUN:
-
-			fmt.Printf("Step %d/%d : RUN %s\n", stepNum, total, inst.Args)
-
-			key := cache.GenerateCacheKey(prevDigest, string(inst.Type)+" "+inst.Args, state.WorkDir, state.Env, nil)
-
-			if !noCache && !cascadeMiss {
-				if digest, hit := cache.CheckCache(key); hit {
-					cache.PrintHit(inst.Args)
-					prevDigest = digest
-					layers = append(layers, digest)
-					continue
-				}
-			}
-
-			cascadeMiss = true
-			cache.PrintMiss(inst.Args)
-
-			beforeFiles, _ := layer.GetAllFiles(contextPath)
-			_, beforeState, _ := layer.GetChangedFiles(contextPath, beforeFiles, prevFileState)
-
-			err := layer.ExecuteRunCommand(inst.Args, contextPath, state.Env)
-			if err != nil {
-				return nil, nil, fmt.Errorf("RUN failed: %w", err)
-			}
-
-			afterFiles, _ := layer.GetAllFiles(contextPath)
-			changedFiles, afterState, _ := layer.GetChangedFiles(contextPath, afterFiles, beforeState)
-			prevFileState = afterState
-
-			if len(changedFiles) == 0 {
-				continue
-			}
-
-			layerObj, err := layer.CreateLayer(contextPath, changedFiles)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			if !noCache {
-				cache.SaveCache(key, layerObj.Digest)
-			}
-
-			prevDigest = layerObj.Digest
-			layers = append(layers, layerObj.Digest)
-
-		case parser.WORKDIR:
-			fmt.Printf("Step %d/%d : WORKDIR %s\n", stepNum, total, inst.Args)
-
-		case parser.ENV:
-			fmt.Printf("Step %d/%d : ENV %s\n", stepNum, total, inst.Args)
-
-		case parser.CMD:
-			fmt.Printf("Step %d/%d : CMD %s\n", stepNum, total, inst.Args)
 		}
+		return result
 	}
 
-	return layers, state, nil
+	// shell style fallback
+	return []string{"sh", "-c", cmd}
 }

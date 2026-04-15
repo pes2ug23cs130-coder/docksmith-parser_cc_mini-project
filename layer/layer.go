@@ -4,13 +4,14 @@ import (
 	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
-	"os/exec"
 )
 
 type Layer struct {
@@ -18,7 +19,9 @@ type Layer struct {
 	Path   string
 }
 
+// CreateLayer creates an immutable deterministic tar layer
 func CreateLayer(basePath string, files []string) (*Layer, error) {
+	sort.Strings(files)
 
 	tmpTar := "layer.tar"
 
@@ -26,13 +29,12 @@ func CreateLayer(basePath string, files []string) (*Layer, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer tarFile.Close()
 
 	tw := tar.NewWriter(tarFile)
-
-	sort.Strings(files)
+	defer tw.Close()
 
 	for _, file := range files {
-
 		fullPath := filepath.Join(basePath, file)
 
 		info, err := os.Stat(fullPath)
@@ -40,45 +42,44 @@ func CreateLayer(basePath string, files []string) (*Layer, error) {
 			return nil, err
 		}
 
-		// skip non-regular files
+		// only regular files
 		if !info.Mode().IsRegular() {
 			continue
 		}
 
-		// read file first (safe)
 		data, err := os.ReadFile(fullPath)
 		if err != nil {
 			return nil, err
 		}
 
-		// create header ONCE
+		// deterministic tar header
 		header := &tar.Header{
-			Name:    file,
-			Mode:    int64(info.Mode().Perm()),
-			Size:    int64(len(data)),
-			ModTime: time.Unix(0, 0),
+			Name:       filepath.ToSlash(file),
+			Mode:       int64(info.Mode().Perm()),
+			Size:       int64(len(data)),
+			ModTime:    time.Unix(0, 0),
+			AccessTime: time.Unix(0, 0),
+			ChangeTime: time.Unix(0, 0),
 		}
 
 		if err := tw.WriteHeader(header); err != nil {
 			return nil, err
 		}
 
-		// write file data
 		if _, err := tw.Write(data); err != nil {
 			return nil, err
 		}
 	}
 
-	// close tar properly
+	// flush writer fully before hashing
 	if err := tw.Close(); err != nil {
 		return nil, err
 	}
-
 	if err := tarFile.Close(); err != nil {
 		return nil, err
 	}
 
-	// compute hash
+	// compute sha256 digest
 	hashFile, err := os.Open(tmpTar)
 	if err != nil {
 		return nil, err
@@ -90,17 +91,23 @@ func CreateLayer(basePath string, files []string) (*Layer, error) {
 		return nil, err
 	}
 
-	digest := hex.EncodeToString(hasher.Sum(nil))
+	digest := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
 
-	// save layer
-	layerPath := filepath.Join(os.Getenv("HOME"), ".docksmith", "layers", digest+".tar")
-	os.MkdirAll(filepath.Dir(layerPath), 0755)
+	layerPath := filepath.Join(
+		os.Getenv("HOME"),
+		".docksmith",
+		"layers",
+		strings.TrimPrefix(digest, "sha256:")+".tar",
+	)
 
-	srcFile, err := os.Open(tmpTar)
-	if err != nil {
+	if err := os.MkdirAll(filepath.Dir(layerPath), 0755); err != nil {
 		return nil, err
 	}
-	defer srcFile.Close()
+
+	// rewind temp tar for copy
+	if _, err := hashFile.Seek(0, 0); err != nil {
+		return nil, err
+	}
 
 	dstFile, err := os.Create(layerPath)
 	if err != nil {
@@ -108,11 +115,11 @@ func CreateLayer(basePath string, files []string) (*Layer, error) {
 	}
 	defer dstFile.Close()
 
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
+	if _, err := io.Copy(dstFile, hashFile); err != nil {
 		return nil, err
 	}
 
-	os.Remove(tmpTar)
+	_ = os.Remove(tmpTar)
 
 	return &Layer{
 		Digest: digest,
@@ -120,8 +127,8 @@ func CreateLayer(basePath string, files []string) (*Layer, error) {
 	}, nil
 }
 
+// GetAllFiles returns all valid files in sorted order
 func GetAllFiles(basePath string) ([]string, error) {
-
 	var files []string
 
 	err := filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
@@ -129,8 +136,11 @@ func GetAllFiles(basePath string) ([]string, error) {
 			return err
 		}
 
-		// skip unwanted dirs
+		// skip docksmith internals and git
 		if strings.Contains(path, ".docksmith") || strings.Contains(path, ".git") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -143,12 +153,15 @@ func GetAllFiles(basePath string) ([]string, error) {
 			return err
 		}
 
-		files = append(files, relPath)
+		files = append(files, filepath.ToSlash(relPath))
 		return nil
 	})
 
+	sort.Strings(files)
 	return files, err
 }
+
+// HashFile computes sha256 of a file
 func HashFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -158,13 +171,15 @@ func HashFile(path string) (string, error) {
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:]), nil
 }
-func GetChangedFiles(basePath string, files []string, prev map[string]string) ([]string, map[string]string, error) {
 
+// GetChangedFiles detects changed files using sha256
+func GetChangedFiles(basePath string, files []string, prev map[string]string) ([]string, map[string]string, error) {
 	current := make(map[string]string)
 	var changed []string
 
-	for _, file := range files {
+	sort.Strings(files)
 
+	for _, file := range files {
 		fullPath := filepath.Join(basePath, file)
 
 		hash, err := HashFile(fullPath)
@@ -174,7 +189,6 @@ func GetChangedFiles(basePath string, files []string, prev map[string]string) ([
 
 		current[file] = hash
 
-		// new file OR modified file
 		if prevHash, ok := prev[file]; !ok || prevHash != hash {
 			changed = append(changed, file)
 		}
@@ -182,12 +196,72 @@ func GetChangedFiles(basePath string, files []string, prev map[string]string) ([
 
 	return changed, current, nil
 }
-func ExecuteRunCommand(command string, workDir string, env map[string]string) error {
 
+// ExtractLayer safely extracts a layer tar into rootfs
+func ExtractLayer(layerDigest, rootfs string) error {
+	layerPath := filepath.Join(
+		os.Getenv("HOME"),
+		".docksmith",
+		"layers",
+		strings.TrimPrefix(layerDigest, "sha256:")+".tar",
+	)
+
+	f, err := os.Open(layerPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	tr := tar.NewReader(f)
+
+	rootfsClean := filepath.Clean(rootfs)
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		clean := filepath.Clean(hdr.Name)
+		target := filepath.Join(rootfsClean, clean)
+
+		// tar-slip protection
+		if !strings.HasPrefix(target, rootfsClean) {
+			return fmt.Errorf("unsafe tar path: %s", hdr.Name)
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return err
+		}
+
+		out, err := os.Create(target)
+		if err != nil {
+			return err
+		}
+
+		if _, err := io.Copy(out, tr); err != nil {
+			out.Close()
+			return err
+		}
+		out.Close()
+	}
+
+	return nil
+}
+
+// ExecuteRunCommand runs a RUN instruction during build.
+// It inherits the host environment (so PATH, sh etc. are available)
+// and appends any ENV variables declared in the Docksmithfile.
+func ExecuteRunCommand(command string, workDir string, env map[string]string) error {
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = workDir
 
-	// set environment variables
+	// ✅ FIX: inherit host env so PATH and sh are available,
+	// then layer on any ENV vars from the Docksmithfile
+	cmd.Env = os.Environ()
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
