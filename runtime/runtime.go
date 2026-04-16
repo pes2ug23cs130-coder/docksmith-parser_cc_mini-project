@@ -6,13 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
-	"syscall"
-	"time"
-
-	"docksmith/layer"
 )
+
+type LayerInfo struct {
+	Digest string `json:"digest"`
+}
 
 type Config struct {
 	Env        []string `json:"Env"`
@@ -20,260 +19,170 @@ type Config struct {
 	WorkingDir string   `json:"WorkingDir"`
 }
 
-type LayerInfo struct {
-	Digest    string `json:"digest"`
-	Size      int64  `json:"size"`
-	CreatedBy string `json:"createdBy"`
-}
-
-type ImageManifest struct {
+type Manifest struct {
 	Name    string      `json:"name"`
 	Tag     string      `json:"tag"`
 	Digest  string      `json:"digest"`
-	Created string      `json:"created"`
 	Config  Config      `json:"config"`
 	Layers  []LayerInfo `json:"layers"`
+	Created string      `json:"created"`
 }
 
-// RunIsolated runs a command inside a chroot-ed rootfs.
-// Used by BOTH the build RUN step and docksmith run.
-func RunIsolated(rootfs string, cmdArgs []string, env []string, workdir string) error {
-	if len(cmdArgs) == 0 {
-		return fmt.Errorf("no command specified")
-	}
+func LoadManifest(imageName string) (*Manifest, error) {
+	parts := strings.Split(imageName, ":")
+	name := parts[0]
 
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Chroot: rootfs,
-	}
-
-	cmd.Env = append(os.Environ(), env...)
-	cmd.Dir = workdir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	return cmd.Run()
-}
-
-// SaveManifest saves the image manifest to ~/.docksmith/images/<imageName>.json
-func SaveManifest(
-	imageName string,
-	tag string,
-	imageDigest string,
-	layerDigests []string,
-	env map[string]string,
-	cmd []string,
-	workDir string,
-	createdBy []string,
-) error {
-	var envList []string
-	for k, v := range env {
-		envList = append(envList, k+"="+v)
-	}
-	sort.Strings(envList)
-
-	var layers []LayerInfo
-	for i, digest := range layerDigests {
-		layerPath := filepath.Join(
-			os.Getenv("HOME"),
-			".docksmith",
-			"layers",
-			strings.TrimPrefix(digest, "sha256:")+".tar",
-		)
-
-		info, err := os.Stat(layerPath)
-		if err != nil {
-			return err
-		}
-
-		cb := ""
-		if i < len(createdBy) {
-			cb = createdBy[i]
-		}
-
-		layers = append(layers, LayerInfo{
-			Digest:    digest,
-			Size:      info.Size(),
-			CreatedBy: cb,
-		})
-	}
-
-	manifest := ImageManifest{
-		Name:    imageName,
-		Tag:     tag,
-		Digest:  imageDigest,
-		Created: time.Now().UTC().Format(time.RFC3339),
-		Config: Config{
-			Env:        envList,
-			Cmd:        cmd,
-			WorkingDir: workDir,
-		},
-		Layers: layers,
-	}
-
-	dir := filepath.Join(os.Getenv("HOME"), ".docksmith", "images")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	path := filepath.Join(dir, imageName+".json")
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(path, data, 0644)
-}
-
-// LoadManifest reads an image manifest from ~/.docksmith/images/
-func LoadManifest(imageName string) (*ImageManifest, error) {
-	path := filepath.Join(
+	manifestPath := filepath.Join(
 		os.Getenv("HOME"),
 		".docksmith",
 		"images",
-		imageName+".json",
+		name+"_latest.json",
 	)
 
-	data, err := os.ReadFile(path)
+	file, err := os.Open(manifestPath)
 	if err != nil {
-		return nil, fmt.Errorf("image not found: %s", imageName)
+		return nil, err
 	}
+	defer file.Close()
 
-	var manifest ImageManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
+	var manifest Manifest
+	err = json.NewDecoder(file).Decode(&manifest)
+	if err != nil {
 		return nil, err
 	}
 
 	return &manifest, nil
 }
 
-// RunContainerWithEnv extracts all image layers and runs the container command.
-func RunContainerWithEnv(imageName string, overrideCmd string, extraEnv []string) error {
-	manifest, err := LoadManifest(imageName)
+func SaveManifest(
+	imageName string,
+	tag string,
+	digest string,
+	layerDigests []string,
+	env map[string]string,
+	cmd []string,
+	workDir string,
+	createdBy []string,
+) error {
+	imageDir := filepath.Join(os.Getenv("HOME"), ".docksmith", "images")
+	err := os.MkdirAll(imageDir, 0755)
 	if err != nil {
 		return err
 	}
 
-	rootfs, err := os.MkdirTemp("", "docksmith-rootfs-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(rootfs)
-
-	fmt.Println("Extracting layers...")
-	for _, layerInfo := range manifest.Layers {
-		if err := layer.ExtractLayer(layerInfo.Digest, rootfs); err != nil {
-			return fmt.Errorf("failed to extract %s: %w", layerInfo.Digest, err)
-		}
-		fmt.Printf("  extracted: %s\n", layerInfo.Digest)
+	var envSlice []string
+	for k, v := range env {
+		envSlice = append(envSlice, k+"="+v)
 	}
 
-	// ✅ FIX: Determine cmdArgs correctly.
-	// manifest.Config.Cmd is already []string — use it directly.
-	// If overrideCmd is provided as a string, wrap it in sh -c.
-	var cmdArgs []string
-	if overrideCmd != "" {
-		cmdArgs = []string{"sh", "-c", overrideCmd}
-	} else {
-		cmdArgs = manifest.Config.Cmd
+	var layers []LayerInfo
+	for _, d := range layerDigests {
+		layers = append(layers, LayerInfo{Digest: d})
 	}
 
-	if len(cmdArgs) == 0 {
-		return fmt.Errorf("no command specified")
+	manifest := Manifest{
+		Name:   imageName,
+		Tag:    tag,
+		Digest: digest,
+		Config: Config{
+			Env:        envSlice,
+			Cmd:        cmd,
+			WorkingDir: workDir,
+		},
+		Layers: layers,
 	}
 
-	env := append(manifest.Config.Env, extraEnv...)
-
-	workDir := manifest.Config.WorkingDir
-	if workDir == "" {
-		workDir = "/"
-	}
-
-	fmt.Printf("Running: %s\n\n", strings.Join(cmdArgs, " "))
-
-	// ✅ FIX: Always use RunHostCommand (host shell) for the demo/mini-project.
-	// RunIsolated with Chroot requires root + a full rootfs with /bin/sh inside it.
-	// Since this project uses a simulated rootfs (no real Alpine binaries),
-	// we run on the host and point workdir into the extracted rootfs.
-	return RunHostCommand(
-		strings.Join(cmdArgs[2:], " "), // extract the actual shell command (index 2 onward)
-		rootfs,
-		env,
-		workDir,
+	manifestPath := filepath.Join(
+		imageDir,
+		imageName+"_"+tag+".json",
 	)
+
+	file, err := os.Create(manifestPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	return json.NewEncoder(file).Encode(manifest)
 }
 
-// ListImages prints all saved images.
 func ListImages() error {
-	dir := filepath.Join(os.Getenv("HOME"), ".docksmith", "images")
-
-	entries, err := os.ReadDir(dir)
+	imageDir := filepath.Join(os.Getenv("HOME"), ".docksmith", "images")
+	files, err := os.ReadDir(imageDir)
 	if err != nil {
-		fmt.Println("No images found.")
-		return nil
+		return err
 	}
 
 	fmt.Printf("%-20s %-10s %-10s\n", "IMAGE", "TAG", "LAYERS")
 	fmt.Println("------------------------------------------------")
 
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) != ".json" {
-			continue
-		}
-
-		name := strings.TrimSuffix(e.Name(), ".json")
-		manifest, err := LoadManifest(name)
+	for _, f := range files {
+		var m Manifest
+		file, err := os.Open(filepath.Join(imageDir, f.Name()))
 		if err != nil {
 			continue
 		}
+		_ = json.NewDecoder(file).Decode(&m)
+		file.Close()
 
-		fmt.Printf(
-			"%-20s %-10s %-10d\n",
-			manifest.Name,
-			manifest.Tag,
-			len(manifest.Layers),
+		fmt.Printf("%-20s %-10s %-10d\n",
+			m.Name,
+			m.Tag,
+			len(m.Layers),
 		)
 	}
 
 	return nil
 }
 
-// RemoveImage deletes an image manifest.
 func RemoveImage(imageName string) error {
-	path := filepath.Join(
+	parts := strings.Split(imageName, ":")
+	name := parts[0]
+
+	manifestPath := filepath.Join(
 		os.Getenv("HOME"),
 		".docksmith",
 		"images",
-		imageName+".json",
+		name+"_latest.json",
 	)
 
-	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("image not found: %s", imageName)
-	}
-
-	fmt.Printf("Deleted image: %s\n", imageName)
-	return nil
+	return os.Remove(manifestPath)
 }
 
-// RunHostCommand runs a shell command on the host machine, with workdir set
-// inside the extracted rootfs. This is the safe fallback for demo builds
-// that don't have real Alpine binaries in the rootfs.
-func RunHostCommand(command string, contextPath string, env []string, workdir string) error {
-	// ✅ FIX: Build the correct host-side working directory.
-	// rootfs/app → we join contextPath + workdir (strip leading slash).
-	hostWorkDir := contextPath
-	if workdir != "" && workdir != "/" {
-		hostWorkDir = filepath.Join(contextPath, strings.TrimPrefix(workdir, "/"))
-	}
-
-	// Auto-create the workdir (mirrors Docker WORKDIR behaviour)
-	if err := os.MkdirAll(hostWorkDir, 0755); err != nil {
+func RunContainerWithEnv(imageName string, overrideCmd string, extraEnv []string) error {
+	manifest, err := LoadManifest(imageName)
+	if err != nil {
 		return err
 	}
 
+	env := append([]string{}, manifest.Config.Env...)
+	env = append(env, extraEnv...)
+
+	command := overrideCmd
+	if command == "" {
+		command = strings.Join(manifest.Config.Cmd, " ")
+	}
+
+	return RunHostCommand(
+		command,
+		".",
+		env,
+		manifest.Config.WorkingDir,
+	)
+}
+
+func RunHostCommand(command string, contextPath string, env []string, workDir string) error {
 	cmd := exec.Command("sh", "-c", command)
-	cmd.Dir = hostWorkDir
+
+	if workDir != "" {
+		if filepath.IsAbs(workDir) {
+			workDir = filepath.Join(contextPath, strings.TrimPrefix(workDir, "/"))
+		}
+		cmd.Dir = workDir
+	} else {
+		cmd.Dir = contextPath
+	}
+
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

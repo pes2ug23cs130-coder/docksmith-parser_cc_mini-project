@@ -34,7 +34,7 @@ func Execute() {
 			fmt.Println("Usage: docksmith rmi <image-name>")
 			return
 		}
-		if err := runtime.RemoveImage(os.Args[2]); err != nil {
+		if err := runtime.RemoveImage(strings.Split(os.Args[2], ":")[0]); err != nil {
 			fmt.Println("Remove Error:", err)
 		}
 
@@ -111,7 +111,7 @@ func runContainer() {
 		return
 	}
 
-	imageName := os.Args[2]
+	imageName := strings.Split(os.Args[2], ":")[0]
 	overrideCmd := ""
 	var envOverrides []string
 

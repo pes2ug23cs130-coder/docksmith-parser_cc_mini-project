@@ -69,7 +69,12 @@ func CheckCache(key string) (string, bool) {
 	}
 
 	// IMPORTANT: also verify layer file actually exists on disk
-	layerPath := filepath.Join(os.Getenv("HOME"), ".docksmith", "layers", entry.LayerDigest+".tar")
+	layerPath := filepath.Join(
+           os.Getenv("HOME"),
+           ".docksmith",
+           "layers",
+           strings.TrimPrefix(entry.LayerDigest, "sha256:")+".tar",
+         )
 	if _, err := os.Stat(layerPath); err != nil {
 		return "", false
 	}

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,13 +28,14 @@ type BuildResult struct {
 func Build(contextPath string, imageName string, tag string, noCache bool) (*BuildResult, error) {
 	docksmithfilePath := filepath.Join(contextPath, "Docksmithfile")
 
-	//
-	// ✅ parser
-	//
-	instructions, state, err := parser.ParseDocksmithfile(docksmithfilePath)
+	instructions, parsedState, err := parser.ParseDocksmithfile(docksmithfilePath)
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
+
+	currentWorkDir := ""
+	currentEnv := make(map[string]string)
+	currentCmd := parsedState.Cmd
 
 	var prevDigest string
 	var layerDigests []string
@@ -50,23 +52,30 @@ func Build(contextPath string, imageName string, tag string, noCache bool) (*Bui
 
 		switch inst.Type {
 
-		//
-		// ✅ FROM loads base manifest
-		//
 		case parser.FROM:
 			fmt.Printf("Step %d/%d : FROM %s\n", stepNum, total, inst.Args)
-
 			prevDigest = inst.Args
 
-			// preserve created timestamp on warm rebuild
 			baseManifest, err := runtime.LoadManifest(inst.Args)
 			if err == nil {
 				baseCreated = baseManifest.Created
 			}
 
-		//
-		// ✅ COPY → cache → layer
-		//
+		case parser.WORKDIR:
+			fmt.Printf("Step %d/%d : WORKDIR %s\n", stepNum, total, inst.Args)
+			currentWorkDir = inst.Args
+
+		case parser.ENV:
+			fmt.Printf("Step %d/%d : ENV %s\n", stepNum, total, inst.Args)
+			parts := strings.SplitN(inst.Args, "=", 2)
+			if len(parts) == 2 {
+				currentEnv[parts[0]] = parts[1]
+			}
+
+		case parser.CMD:
+			fmt.Printf("Step %d/%d : CMD %s\n", stepNum, total, inst.Args)
+			currentCmd = inst.Args
+
 		case parser.COPY:
 			fmt.Printf("Step %d/%d : COPY %s\n", stepNum, total, inst.Args)
 
@@ -87,8 +96,8 @@ func Build(contextPath string, imageName string, tag string, noCache bool) (*Bui
 			key := cache.GenerateCacheKey(
 				prevDigest,
 				"COPY "+inst.Args,
-				state.WorkDir,
-				state.Env,
+				currentWorkDir,
+				currentEnv,
 				fileHashes,
 			)
 
@@ -128,17 +137,14 @@ func Build(contextPath string, imageName string, tag string, noCache bool) (*Bui
 			layerDigests = append(layerDigests, layerObj.Digest)
 			createdBy = append(createdBy, "COPY "+inst.Args)
 
-		//
-		// ✅ RUN → cache → isolated runtime → layer
-		//
 		case parser.RUN:
 			fmt.Printf("Step %d/%d : RUN %s\n", stepNum, total, inst.Args)
 
 			key := cache.GenerateCacheKey(
 				prevDigest,
 				"RUN "+inst.Args,
-				state.WorkDir,
-				state.Env,
+				currentWorkDir,
+				currentEnv,
 				nil,
 			)
 
@@ -158,14 +164,11 @@ func Build(contextPath string, imageName string, tag string, noCache bool) (*Bui
 			beforeFiles, _ := layer.GetAllFiles(contextPath)
 			_, beforeState, _ := layer.GetChangedFiles(contextPath, beforeFiles, prevFileState)
 
-			//
-			// ✅ REQUIRED isolated execution
-			//
 			err := runtime.RunHostCommand(
 				inst.Args,
 				contextPath,
-				envMapToSlice(state.Env),
-				state.WorkDir,
+				envMapToSlice(currentEnv),
+				currentWorkDir,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("RUN failed: %w", err)
@@ -176,7 +179,13 @@ func Build(contextPath string, imageName string, tag string, noCache bool) (*Bui
 			prevFileState = afterState
 
 			if len(changedFiles) == 0 {
-				continue
+				markerFile := ".docksmith_run_marker"
+				markerPath := filepath.Join(contextPath, markerFile)
+
+				err := os.WriteFile(markerPath, []byte(inst.Args), 0644)
+				if err == nil {
+					changedFiles = []string{markerFile}
+				}
 			}
 
 			layerObj, err := layer.CreateLayer(contextPath, changedFiles)
@@ -191,21 +200,9 @@ func Build(contextPath string, imageName string, tag string, noCache bool) (*Bui
 			prevDigest = layerObj.Digest
 			layerDigests = append(layerDigests, layerObj.Digest)
 			createdBy = append(createdBy, "RUN "+inst.Args)
-
-		case parser.WORKDIR:
-			fmt.Printf("Step %d/%d : WORKDIR %s\n", stepNum, total, inst.Args)
-
-		case parser.ENV:
-			fmt.Printf("Step %d/%d : ENV %s\n", stepNum, total, inst.Args)
-
-		case parser.CMD:
-			fmt.Printf("Step %d/%d : CMD %s\n", stepNum, total, inst.Args)
 		}
 	}
 
-	//
-	// ✅ deterministic image digest from layer chain
-	//
 	h := sha256.New()
 	sorted := append([]string{}, layerDigests...)
 	sort.Strings(sorted)
@@ -216,19 +213,16 @@ func Build(contextPath string, imageName string, tag string, noCache bool) (*Bui
 
 	imageDigest := "sha256:" + hex.EncodeToString(h.Sum(nil))
 
-	result := &BuildResult{
+	return &BuildResult{
 		ImageDigest:  imageDigest,
 		LayerDigests: layerDigests,
-		Env:          state.Env,
-		Cmd:          parseCmd(state.Cmd),
-		WorkDir:      state.WorkDir,
+		Env:          currentEnv,
+		Cmd:          parseCmd(currentCmd),
+		WorkDir:      currentWorkDir,
 		CreatedBy:    createdBy,
 		Created:      baseCreated,
-	}
-
-	return result, nil
+	}, nil
 }
-
 func envMapToSlice(env map[string]string) []string {
 	var result []string
 	for k, v := range env {
@@ -240,25 +234,23 @@ func envMapToSlice(env map[string]string) []string {
 
 func parseCmd(cmd string) []string {
 	cmd = strings.TrimSpace(cmd)
+	cmd = strings.TrimPrefix(cmd, "[")
+	cmd = strings.TrimSuffix(cmd, "]")
 
-	// JSON array style CMD
-	if strings.HasPrefix(cmd, "[") && strings.HasSuffix(cmd, "]") {
-		cmd = strings.TrimPrefix(cmd, "[")
-		cmd = strings.TrimSuffix(cmd, "]")
-
-		parts := strings.Split(cmd, ",")
-
-		var result []string
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			p = strings.Trim(p, `"`)
-			if p != "" {
-				result = append(result, p)
-			}
-		}
-		return result
+	if cmd == "" {
+		return nil
 	}
 
-	// shell style fallback
-	return []string{"sh", "-c", cmd}
+	parts := strings.Split(cmd, ",")
+	var result []string
+
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.Trim(p, `"`)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+
+	return result
 }

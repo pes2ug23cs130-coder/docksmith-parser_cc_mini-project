@@ -1,4 +1,6 @@
 FROM alpine:3.18
 WORKDIR /app
 ENV MESSAGE=Hello
+COPY app /app
+RUN echo "build complete" > build.txt
 CMD ["/bin/sh","-c","echo $MESSAGE && echo build complete"]
